@@ -34,6 +34,7 @@ enum Op {
     Read,
     Write,
     Close,
+    Statx,
 }
 
 /// A future representing an opening file.
@@ -134,10 +135,30 @@ impl<D: Drive> File<D> {
         if let Some(active) = engine.active() {
             let cancellation = match active {
                 Op::Read | Op::Write    => buf.cancellation(),
+                Op::Statx               => buf.statx_cancellation(),
                 Op::Close               => Cancellation::null(),
             };
             engine.as_mut().cancel(cancellation);
             engine.unset_active();
+        }
+    }
+
+    fn poll_file_size(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        if !matches!(self.engine.active(), None | Some(&Op::Statx)) {
+            self.as_mut().cancel();
+        }
+
+        let (mut engine, buf, _) = self.split();
+        engine.as_mut().set_active(Op::Statx);
+        let statx = buf.as_statx();
+        let flags = libc::AT_EMPTY_PATH;
+        let mask = libc::STATX_SIZE;
+        unsafe {
+            ready!(engine.as_mut().poll(ctx, |sqe, fd| {
+                uring_sys::io_uring_prep_statx(sqe.raw_mut(), fd, &0, flags, mask, statx);
+            }))?;
+
+            Poll::Ready(Ok((*statx).stx_size as usize))
         }
     }
 
@@ -248,7 +269,7 @@ impl<D: Drive> AsyncWrite for File<D> {
 }
 
 impl<D: Drive> AsyncSeek for File<D> {
-    fn poll_seek(mut self: Pin<&mut Self>, _: &mut Context, pos: io::SeekFrom)
+    fn poll_seek(mut self: Pin<&mut Self>, ctx: &mut Context, pos: io::SeekFrom)
         -> Poll<io::Result<u64>>
     {
         match pos {
@@ -256,9 +277,9 @@ impl<D: Drive> AsyncSeek for File<D> {
             io::SeekFrom::Current(n)    => {
                 *self.as_mut().pos() += if n < 0 { n.abs() } else { n } as usize;
             }
-            io::SeekFrom::End(_)        => {
-                const MSG: &str = "cannot seek to end of io-uring file";
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, MSG)))
+            io::SeekFrom::End(n)        => {
+                let end = ready!(self.as_mut().poll_file_size(ctx))?;
+                *self.as_mut().pos() = end + if n < 0 { n.abs() } else { n} as usize;
             }
         }
         Poll::Ready(Ok(self.pos as u64))
@@ -339,7 +360,24 @@ impl Buffer {
 
     fn cancellation(&mut self) -> Cancellation {
         let data = mem::replace(&mut self.data, ptr::null_mut());
-        unsafe { Cancellation::buffer(data, self.capacity as usize) }
+        if data == ptr::null_mut() {
+            Cancellation::null()
+        } else {
+            unsafe { Cancellation::buffer(data, self.capacity as usize) }
+        }
+    }
+
+    fn statx_cancellation(&mut self) -> Cancellation {
+        let data = mem::replace(&mut self.data, ptr::null_mut());
+        if data == ptr::null_mut() {
+            Cancellation::null()
+        } else {
+            unsafe fn callback(statx: *mut (), _: usize) {
+                dealloc(statx as *mut u8, Layout::new::<libc::statx>())
+            }
+
+            Cancellation::new(data as *mut (), 0, callback)
+        }
     }
 
     #[inline(always)]
@@ -354,6 +392,18 @@ impl Buffer {
         }
 
         self.data
+    }
+
+    #[inline(always)]
+    fn as_statx(&mut self) -> *mut libc::statx {
+        unsafe {
+            if self.data != ptr::null_mut() {
+                    dealloc(self.data, Layout::array::<u8>(self.capacity as usize).unwrap());
+            }
+
+            self.data = alloc(Layout::new::<libc::statx>());
+            self.data as *mut libc::statx
+        }
     }
 }
 
