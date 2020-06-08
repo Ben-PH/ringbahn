@@ -144,6 +144,8 @@ impl<D: Drive> File<D> {
     }
 
     fn poll_file_size(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        static EMPTY: libc::c_char = 0;
+
         if !matches!(self.engine.active(), None | Some(&Op::Statx)) {
             self.as_mut().cancel();
         }
@@ -155,7 +157,7 @@ impl<D: Drive> File<D> {
         let mask = libc::STATX_SIZE;
         unsafe {
             ready!(engine.as_mut().poll(ctx, |sqe, fd| {
-                uring_sys::io_uring_prep_statx(sqe.raw_mut(), fd, &0, flags, mask, statx);
+                uring_sys::io_uring_prep_statx(sqe.raw_mut(), fd, &EMPTY, flags, mask, statx);
             }))?;
 
             Poll::Ready(Ok((*statx).stx_size as usize))
@@ -409,13 +411,3 @@ impl Buffer {
 
 unsafe impl Send for Buffer { }
 unsafe impl Sync for Buffer { }
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        if self.data != ptr::null_mut() {
-            unsafe {
-                dealloc(self.data, Layout::array::<u8>(self.capacity as usize).unwrap());
-            }
-        }
-    }
-}
